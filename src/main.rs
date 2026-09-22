@@ -287,47 +287,43 @@ async fn manager_user(State(state): State<AppState>, Json(req): Json<UserReq>) -
 // =====================================================================
 #[derive(Deserialize)]
 struct ProductoReq {
-    producto: Value, // id (número) o nombre (texto)
-    so: String,      // "windows", "mac" o "linux"
+    producto: Value,  // id (número) o nombre (texto)
+    so: String,       // "windows", "mac" o "linux"
+    version: String,  // ej. "1.0.0"
 }
 
 async fn manager_productos(State(state): State<AppState>, Json(req): Json<ProductoReq>) -> Resp {
-    // Columna según el sistema operativo (lista fija, no viene del usuario)
     let so = req.so.to_lowercase();
-    let columna = match so.as_str() {
-        "windows" | "win" => "path_win",
-        "mac" | "mac-os" | "macOS" => "path_mac",
-        "linux" | "ubuntu" => "path_linux",
-        _ => {
-            return error(
-                StatusCode::BAD_REQUEST,
-                "so debe ser windows, macOs o linux",
-            )
-        }
+    let so = match so.as_str() {
+        "windows" | "win" => "windows",
+        "mac" | "macos" | "mac-os" => "mac",
+        "linux" | "ubuntu" => "linux",
+        _ => return error(StatusCode::BAD_REQUEST, "so debe ser windows, mac o linux"),
     };
+
+    if req.version.trim().is_empty() {
+        return error(StatusCode::BAD_REQUEST, "Falta version");
+    }
 
     // El producto puede llegar como id o como nombre
     let clave = match &req.producto {
         Value::Number(n) => n.to_string(),
         Value::String(s) => s.clone(),
-        _ => {
-            return error(
-                StatusCode::BAD_REQUEST,
-                "producto debe ser un id o un nombre",
-            )
-        }
+        _ => return error(StatusCode::BAD_REQUEST, "producto debe ser un id o un nombre"),
     };
 
-    let sql = format!(
-        "SELECT id, name, {columna} FROM productos
+    // #>> baja por el JSON usando un array de claves: data_json -> so -> version
+    let fila: Result<Option<(i32, String, Option<String>)>, sqlx::Error> = sqlx::query_as(
+        "SELECT id, name, data_json #>> ARRAY[$2, $3]
+         FROM productos
          WHERE id::text = $1 OR lower(name) = lower($1)
-         LIMIT 1"
-    );
-
-    let fila: Result<Option<(i32, String, Option<String>)>, sqlx::Error> = sqlx::query_as(&sql)
-        .bind(&clave)
-        .fetch_optional(&state.pool)
-        .await;
+         LIMIT 1",
+    )
+    .bind(&clave)
+    .bind(so)
+    .bind(&req.version)
+    .fetch_optional(&state.pool)
+    .await;
 
     let (id, name, ruta) = match fila {
         Ok(Some(f)) => f,
@@ -338,13 +334,13 @@ async fn manager_productos(State(state): State<AppState>, Json(req): Json<Produc
     let Some(ruta) = ruta.filter(|r| !r.is_empty()) else {
         return error(
             StatusCode::NOT_FOUND,
-            "No hay instalador para ese sistema operativo",
+            "No existe esa versión para ese producto y sistema operativo",
         );
     };
 
     // URL completa: si la ruta ya es una URL se usa tal cual
     let url: String = if ruta.starts_with("http") {
-        ruta.to_string()
+        ruta
     } else {
         let base: String = std::env::var("STORAGE_URL").unwrap_or_default();
         format!(
@@ -354,7 +350,6 @@ async fn manager_productos(State(state): State<AppState>, Json(req): Json<Produc
         )
     };
 
-    // Sumar la descarga (si falla, no bloquea la respuesta)
     if let Err(e) =
         sqlx::query("UPDATE productos SET number_downloads = number_downloads + 1 WHERE id = $1")
             .bind(id)
@@ -364,7 +359,7 @@ async fn manager_productos(State(state): State<AppState>, Json(req): Json<Produc
         eprintln!("No se pudo contar la descarga: {e}");
     }
 
-    ok(json!({ "id": id, "name": name, "so": so, "url": url }))
+    ok(json!({ "id": id, "name": name, "so": so, "version": req.version, "url": url }))
 }
 
 // =====================================================================
