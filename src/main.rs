@@ -385,7 +385,7 @@ async fn lista_productos(State(state): State<AppState>) -> Resp {
 
 // =====================================================================
 // FUNCIÓN 3: (ponle el nombre que quieras)
-// Ruta: POST /manager3
+// Ruta: POST /managerNoticias
 // =====================================================================
 async fn manager_noticias(State(state): State<AppState>) -> Resp {
     // TODO: tu SQL
@@ -428,7 +428,7 @@ async fn main() {
         .route("/managerUser", post(manager_user))
         .route("/managerProductos", post(manager_productos))
         .route("/listaProductos", get(lista_productos))
-        .route("/manager_noticias", post(manager_noticias))
+        .route("/managerNoticias", post(manager_noticias))
         .layer(cors)
         .with_state(AppState { pool });
 
