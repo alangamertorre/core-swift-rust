@@ -65,20 +65,35 @@ fn password_correcta(password: &str, hash: &str) -> bool {
 }
 
 // Comprueba user_name + password. Devuelve Err(respuesta) si no coinciden.
-async fn verificar_usuario(pool: &PgPool, user_name: &str, password: &str) -> Result<(), Resp> {
-    let hash: Option<String> =
-        sqlx::query_scalar("SELECT password FROM usuarios WHERE user_name = $1")
-            .bind(user_name)
-            .fetch_optional(pool)
-            .await
-            .map_err(db_error)?;
+async fn verificar_usuario(
+    pool: &PgPool,
+    user_name: Option<&str>,
+    email: Option<&str>,
+    password: &str,
+) -> Result<(), Resp> {
+    if user_name.is_none() && email.is_none() {
+        return Err(error(
+            StatusCode::UNAUTHORIZED,
+            "Username or email is required",
+        ));
+    }
+
+    let hash: Option<String> = sqlx::query_scalar(
+        "SELECT password FROM usuarios WHERE user_name = $1 OR email = $2"
+    )
+    .bind(user_name)
+    .bind(email)
+    .fetch_optional(pool)
+    .await
+    .map_err(db_error)?;
 
     match hash {
         Some(h) if password_correcta(password, &h) => Ok(()),
-        // Mismo mensaje si no existe o si la contraseña falla (no revela cuál)
+        // Same message whether the user doesn't exist, the password is wrong,
+        // or it's a Google account with no password set
         _ => Err(error(
             StatusCode::UNAUTHORIZED,
-            "Usuario o contraseña incorrectos",
+            "Invalid username/email or password",
         )),
     }
 }
@@ -92,12 +107,12 @@ async fn manager_user(State(state): State<AppState>, Json(req): Json<UserReq>) -
         // ---------- GET: leer un usuario ----------
         "get" => {
             let Some(user_name) = req.user_name else {
-                return error(StatusCode::BAD_REQUEST, "Falta user_name");
+                return error(StatusCode::BAD_REQUEST, "Missing user_name");
             };
 
             let fila: Result<Option<Value>, sqlx::Error> = sqlx::query_scalar(
                 "SELECT row_to_json(u) FROM (
-                    SELECT id, user_name, email, name, fecha_registro, ultimo_acceso, programas_download
+                    SELECT id, user_name, email, name, auth_provider, fecha_registro, ultimo_acceso, programas_download
                     FROM usuarios WHERE user_name = $1
                  ) u",
             )
@@ -107,39 +122,39 @@ async fn manager_user(State(state): State<AppState>, Json(req): Json<UserReq>) -
 
             match fila {
                 Ok(Some(usuario)) => ok(usuario),
-                Ok(None) => error(StatusCode::NOT_FOUND, "Usuario no encontrado"),
+                Ok(None) => error(StatusCode::NOT_FOUND, "User not found"),
                 Err(e) => db_error(e),
             }
         }
 
-        // ---------- REGISTER: crear usuario ----------
+        // ---------- REGISTER: crear usuario (siempre local) ----------
         "register" => {
             let (Some(user_name), Some(email), Some(password), Some(name)) =
                 (req.user_name, req.email, req.password, req.name)
             else {
                 return error(
                     StatusCode::BAD_REQUEST,
-                    "Faltan campos: user_name, email, password, name",
+                    "Missing fields: user_name, email, password, name",
                 );
             };
 
             if password.len() < 8 {
                 return error(
                     StatusCode::BAD_REQUEST,
-                    "La contraseña debe tener al menos 8 caracteres",
+                    "Password must be at least 8 characters long",
                 );
             }
 
             let Ok(hash) = hashear(&password) else {
                 return error(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    "Error al procesar la contraseña",
+                    "Error processing password",
                 );
             };
 
             let res: Result<String, sqlx::Error> = sqlx::query_scalar(
-                "INSERT INTO usuarios (user_name, email, password, name)
-                 VALUES ($1, $2, $3, $4)
+                "INSERT INTO usuarios (user_name, email, password, name, auth_provider)
+                 VALUES ($1, $2, $3, $4, 'local')
                  RETURNING id::text",
             )
             .bind(user_name)
@@ -152,22 +167,33 @@ async fn manager_user(State(state): State<AppState>, Json(req): Json<UserReq>) -
             match res {
                 Ok(id) => ok(json!({ "id": id })),
                 Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
-                    error(StatusCode::CONFLICT, "El usuario o el email ya existe")
+                    error(StatusCode::CONFLICT, "User or email already exists")
                 }
                 Err(e) => db_error(e),
             }
         }
 
-        // ---------- LOGIN: comprobar contraseña y actualizar ultimo_acceso ----------
+        // ---------- LOGIN: user_name o email + password ----------
         "login" => {
-            let (Some(user_name), Some(password)) = (req.user_name, req.password) else {
-                return error(
-                    StatusCode::BAD_REQUEST,
-                    "Faltan campos: user_name, password",
-                );
+            let Some(password) = req.password else {
+                return error(StatusCode::BAD_REQUEST, "Missing field: password");
             };
 
-            if let Err(resp) = verificar_usuario(&state.pool, &user_name, &password).await {
+            if req.user_name.is_none() && req.email.is_none() {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "Missing field: user_name or email",
+                );
+            }
+
+            if let Err(resp) = verificar_usuario(
+                &state.pool,
+                req.user_name.as_deref(),
+                req.email.as_deref(),
+                &password,
+            )
+            .await
+            {
                 return resp;
             }
 
@@ -175,12 +201,13 @@ async fn manager_user(State(state): State<AppState>, Json(req): Json<UserReq>) -
             let res: Result<Value, sqlx::Error> = sqlx::query_scalar(
                 "WITH u AS (
                     UPDATE usuarios SET ultimo_acceso = now()
-                    WHERE user_name = $1
-                    RETURNING id, user_name, email, name, fecha_registro, ultimo_acceso, programas_download
+                    WHERE user_name = $1 OR email = $2
+                    RETURNING id, user_name, email, name, auth_provider, fecha_registro, ultimo_acceso, programas_download
                  )
                  SELECT row_to_json(u) FROM u",
             )
-            .bind(user_name)
+            .bind(req.user_name)
+            .bind(req.email)
             .fetch_one(&state.pool)
             .await;
 
@@ -191,17 +218,17 @@ async fn manager_user(State(state): State<AppState>, Json(req): Json<UserReq>) -
         }
 
         // ---------- UPDATE: cambiar email, name y/o contraseña ----------
-        // Requiere user_name + password (la actual). Nuevos valores opcionales:
-        // email, name, new_password
         "update" => {
             let (Some(user_name), Some(password)) = (req.user_name, req.password) else {
                 return error(
                     StatusCode::BAD_REQUEST,
-                    "Faltan campos: user_name, password",
+                    "Missing fields: user_name, password",
                 );
             };
 
-            if let Err(resp) = verificar_usuario(&state.pool, &user_name, &password).await {
+            if let Err(resp) =
+                verificar_usuario(&state.pool, Some(&user_name), None, &password).await
+            {
                 return resp;
             }
 
@@ -210,7 +237,7 @@ async fn manager_user(State(state): State<AppState>, Json(req): Json<UserReq>) -
                     if p.len() < 8 {
                         return error(
                             StatusCode::BAD_REQUEST,
-                            "La nueva contraseña debe tener al menos 8 caracteres",
+                            "New password must be at least 8 characters long",
                         );
                     }
                     match hashear(&p) {
@@ -218,7 +245,7 @@ async fn manager_user(State(state): State<AppState>, Json(req): Json<UserReq>) -
                         Err(_) => {
                             return error(
                                 StatusCode::INTERNAL_SERVER_ERROR,
-                                "Error al procesar la contraseña",
+                                "Error processing password",
                             )
                         }
                     }
@@ -226,7 +253,6 @@ async fn manager_user(State(state): State<AppState>, Json(req): Json<UserReq>) -
                 None => None,
             };
 
-            // COALESCE: si el valor nuevo es NULL, se deja el que ya había
             let res = sqlx::query(
                 "UPDATE usuarios
                  SET email    = COALESCE($2, email),
@@ -242,25 +268,26 @@ async fn manager_user(State(state): State<AppState>, Json(req): Json<UserReq>) -
             .await;
 
             match res {
-                Ok(_) => ok(json!({ "actualizado": true })),
+                Ok(_) => ok(json!({ "updated": true })),
                 Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
-                    error(StatusCode::CONFLICT, "Ese email ya está en uso")
+                    error(StatusCode::CONFLICT, "That email is already in use")
                 }
                 Err(e) => db_error(e),
             }
         }
 
         // ---------- DELETE: borrar la cuenta ----------
-        // Requiere user_name + password
         "delete" => {
             let (Some(user_name), Some(password)) = (req.user_name, req.password) else {
                 return error(
                     StatusCode::BAD_REQUEST,
-                    "Faltan campos: user_name, password",
+                    "Missing fields: user_name, password",
                 );
             };
 
-            if let Err(resp) = verificar_usuario(&state.pool, &user_name, &password).await {
+            if let Err(resp) =
+                verificar_usuario(&state.pool, Some(&user_name), None, &password).await
+            {
                 return resp;
             }
 
@@ -270,12 +297,12 @@ async fn manager_user(State(state): State<AppState>, Json(req): Json<UserReq>) -
                 .await;
 
             match res {
-                Ok(r) => ok(json!({ "borrados": r.rows_affected() })),
+                Ok(r) => ok(json!({ "deleted": r.rows_affected() })),
                 Err(e) => db_error(e),
             }
         }
 
-        _ => error(StatusCode::BAD_REQUEST, "mode no válido"),
+        _ => error(StatusCode::BAD_REQUEST, "Invalid mode"),
     }
 }
 
