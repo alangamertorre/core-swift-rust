@@ -396,7 +396,7 @@ async fn manager_productos(State(state): State<AppState>, Json(req): Json<Produc
 async fn lista_productos(State(state): State<AppState>) -> Resp {
     let filas: Result<Vec<Value>, sqlx::Error> = sqlx::query_scalar(
         "SELECT row_to_json(p) FROM (
-           SELECT id, raw_name, name
+           SELECT id, raw_name, name, data_json
            FROM productos
            ORDER BY name
         ) p",
