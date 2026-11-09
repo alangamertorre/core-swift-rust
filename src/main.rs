@@ -78,14 +78,13 @@ async fn verificar_usuario(
         ));
     }
 
-    let hash: Option<String> = sqlx::query_scalar(
-        "SELECT password FROM usuarios WHERE user_name = $1 OR email = $2"
-    )
-    .bind(user_name)
-    .bind(email)
-    .fetch_optional(pool)
-    .await
-    .map_err(db_error)?;
+    let hash: Option<String> =
+        sqlx::query_scalar("SELECT password FROM usuarios WHERE user_name = $1 OR email = $2")
+            .bind(user_name)
+            .bind(email)
+            .fetch_optional(pool)
+            .await
+            .map_err(db_error)?;
 
     match hash {
         Some(h) if password_correcta(password, &h) => Ok(()),
@@ -180,10 +179,7 @@ async fn manager_user(State(state): State<AppState>, Json(req): Json<UserReq>) -
             };
 
             if req.user_name.is_none() && req.email.is_none() {
-                return error(
-                    StatusCode::BAD_REQUEST,
-                    "Missing field: user_name or email",
-                );
+                return error(StatusCode::BAD_REQUEST, "Missing field: user_name or email");
             }
 
             if let Err(resp) = verificar_usuario(
@@ -314,9 +310,9 @@ async fn manager_user(State(state): State<AppState>, Json(req): Json<UserReq>) -
 // =====================================================================
 #[derive(Deserialize)]
 struct ProductoReq {
-    producto: Value,  // id (número) o nombre (texto)
-    so: String,       // "windows", "mac" o "linux"
-    version: String,  // ej. "1.0.0"
+    producto: Value, // id (número) o nombre (texto)
+    so: String,      // "windows", "mac" o "linux"
+    version: String, // ej. "1.0.0"
 }
 
 async fn manager_productos(State(state): State<AppState>, Json(req): Json<ProductoReq>) -> Resp {
@@ -336,15 +332,24 @@ async fn manager_productos(State(state): State<AppState>, Json(req): Json<Produc
     let clave = match &req.producto {
         Value::Number(n) => n.to_string(),
         Value::String(s) => s.clone(),
-        _ => return error(StatusCode::BAD_REQUEST, "producto debe ser un id o un nombre"),
+        _ => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "producto debe ser un id o un nombre",
+            )
+        }
     };
 
     // #>> baja por el JSON usando un array de claves: data_json -> so -> version
     let fila: Result<Option<(i32, String, Option<String>)>, sqlx::Error> = sqlx::query_as(
-        "SELECT id, name, data_json #>> ARRAY[$2, $3]
-         FROM productos
-         WHERE id::text = $1 OR lower(name) = lower($1)
-         LIMIT 1",
+        "
+            SELECT
+              id,
+              name,
+              data_json #>> ARRAY['$3', '$2']
+            FROM productos
+            WHERE id = $1
+            LIMIT 1;",
     )
     .bind(&clave)
     .bind(so)
