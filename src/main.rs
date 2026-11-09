@@ -341,6 +341,9 @@ async fn manager_productos(State(state): State<AppState>, Json(req): Json<Produc
     };
 
     // #>> baja por el JSON usando un array de claves: data_json -> so -> version
+    //clave es un String el sql necesita un i32
+    let clave_i32: &i32 = &clave.parse::<i32>().unwrap();
+
     let fila: Result<Option<(i32, String, Option<String>)>, sqlx::Error> = sqlx::query_as(
         "
             SELECT
@@ -351,7 +354,7 @@ async fn manager_productos(State(state): State<AppState>, Json(req): Json<Produc
             WHERE id = $1
             LIMIT 1;",
     )
-    .bind(&clave)
+    .bind(&clave_i32)
     .bind(so)
     .bind(&req.version)
     .fetch_optional(&state.pool)
