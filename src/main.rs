@@ -475,7 +475,7 @@ async fn manager_noticias(State(state): State<AppState>) -> Resp {
 #[tokio::main]
 async fn main() {
     dotenvy::dotenv().ok();
-    let url = std::env::var("DATABASE_URL").expect("Falta DATABASE_URL");
+    let url = std::env::var("DATABASE_URL").expect("Falta o no es valido DATABASE_URL");
 
     let pool = PgPoolOptions::new()
         .max_connections(5)
