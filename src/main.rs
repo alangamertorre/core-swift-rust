@@ -312,11 +312,12 @@ async fn manager_user(State(state): State<AppState>, Json(req): Json<UserReq>) -
 struct ProductoReq {
     producto: Value, // id (número) o nombre (texto)
     so: String,      // "windows", "mac" o "linux"
-    version: String, // ej. "1.0.0"
+    version: String, // ej. "1.0.0" o "beta-1.3"
 }
 
 async fn manager_productos(State(state): State<AppState>, Json(req): Json<ProductoReq>) -> Resp {
     let so = req.so.to_lowercase();
+
     let so = match so.as_str() {
         "windows" | "win" => "windows",
         "mac" | "macos" | "mac-os" => "mac",
@@ -325,13 +326,50 @@ async fn manager_productos(State(state): State<AppState>, Json(req): Json<Produc
     };
 
     if req.version.trim().is_empty() {
-        return error(StatusCode::BAD_REQUEST, "Falta version");
+        return error(StatusCode::BAD_REQUEST, "Falta la version");
     }
 
-    // El producto puede llegar como id o como nombre
-    let clave = match &req.producto {
-        Value::Number(n) => n.to_string(),
-        Value::String(s) => s.clone(),
+    type ProductoRow = (i32, String, Option<String>);
+
+    let fila: Result<Option<ProductoRow>, sqlx::Error> = match &req.producto {
+        Value::Number(n) => {
+            let Some(id) = n.as_i64().and_then(|v| i32::try_from(v).ok()) else {
+                return error(StatusCode::BAD_REQUEST, "ID de producto no valido");
+            };
+
+            sqlx::query_as::<_, ProductoRow>(
+                "SELECT id, name, data_json #>> ARRAY[$2, $3]
+                 FROM productos
+                 WHERE id = $1
+                 LIMIT 1",
+            )
+            .bind(id)
+            .bind(&req.version)
+            .bind(so)
+            .fetch_optional(&state.pool)
+            .await
+        }
+
+        Value::String(nombre) => {
+            let nombre = nombre.trim();
+
+            if nombre.is_empty() {
+                return error(StatusCode::BAD_REQUEST, "Nombre de producto vacio");
+            }
+
+            sqlx::query_as::<_, ProductoRow>(
+                "SELECT id, name, data_json #>> ARRAY[$2, $3]
+                 FROM productos
+                 WHERE raw_name = $1
+                 LIMIT 1",
+            )
+            .bind(nombre)
+            .bind(&req.version)
+            .bind(so)
+            .fetch_optional(&state.pool)
+            .await
+        }
+
         _ => {
             return error(
                 StatusCode::BAD_REQUEST,
@@ -339,26 +377,6 @@ async fn manager_productos(State(state): State<AppState>, Json(req): Json<Produc
             )
         }
     };
-
-    // #>> baja por el JSON usando un array de claves: data_json -> so -> version
-    //clave es un String el sql necesita un i32
-    let clave_i32: &i32 = &clave.parse::<i32>().unwrap();
-
-    let fila: Result<Option<(i32, String, Option<String>)>, sqlx::Error> = sqlx::query_as(
-        "
-            SELECT
-              id,
-              name,
-              data_json #>> ARRAY['$3', '$2']
-            FROM productos
-            WHERE id = $1
-            LIMIT 1;",
-    )
-    .bind(&clave_i32)
-    .bind(so)
-    .bind(&req.version)
-    .fetch_optional(&state.pool)
-    .await;
 
     let (id, name, ruta) = match fila {
         Ok(Some(f)) => f,
@@ -369,15 +387,19 @@ async fn manager_productos(State(state): State<AppState>, Json(req): Json<Produc
     let Some(ruta) = ruta.filter(|r| !r.is_empty()) else {
         return error(
             StatusCode::NOT_FOUND,
-            "No existe esa versión para ese producto y sistema operativo",
+            "No existe esa version para ese producto y sistema operativo",
         );
     };
 
-    // URL completa: si la ruta ya es una URL se usa tal cual
-    let url: String = if ruta.starts_with("http") {
+    let url = if ruta.starts_with("https://") || ruta.starts_with("http://") {
         ruta
     } else {
-        let base: String = std::env::var("STORAGE_URL").unwrap_or_default();
+        let base = std::env::var("STORAGE_URL").unwrap_or_default();
+
+        if base.trim().is_empty() {
+            return error(StatusCode::INTERNAL_SERVER_ERROR, "Falta STORAGE_URL");
+        }
+
         format!(
             "{}/{}",
             base.trim_end_matches('/'),
@@ -385,16 +407,25 @@ async fn manager_productos(State(state): State<AppState>, Json(req): Json<Produc
         )
     };
 
-    if let Err(e) =
-        sqlx::query("UPDATE productos SET number_downloads = number_downloads + 1 WHERE id = $1")
-            .bind(id)
-            .execute(&state.pool)
-            .await
+    if let Err(e) = sqlx::query(
+        "UPDATE productos
+         SET number_downloads = number_downloads + 1
+         WHERE id = $1",
+    )
+    .bind(id)
+    .execute(&state.pool)
+    .await
     {
         eprintln!("No se pudo contar la descarga: {e}");
     }
 
-    ok(json!({ "id": id, "name": name, "so": so, "version": req.version, "url": url }))
+    ok(json!({
+        "id": id,
+        "name": name,
+        "so": so,
+        "version": req.version,
+        "url": url
+    }))
 }
 
 // =====================================================================
@@ -454,8 +485,20 @@ async fn main() {
     println!("Conectado a Supabase");
 
     // CORS abierto para pruebas. En producción pon solo el dominio de tu frontend.
+    let allowed_origins = std::env::var("ALLOW_ORIGINS").expect("Falta ALLOW_ORIGINS");
+
+    let origins = allowed_origins
+        .split(',')
+        .map(|origin| {
+            origin
+                .trim()
+                .parse::<axum::http::HeaderValue>()
+                .expect("Origen CORS no válido")
+        })
+        .collect::<Vec<_>>();
+
     let cors = CorsLayer::new()
-        .allow_origin(Any)
+        .allow_origin(origins)
         .allow_methods(Any)
         .allow_headers(Any);
 
